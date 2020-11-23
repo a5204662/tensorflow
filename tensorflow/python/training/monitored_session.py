@@ -1231,11 +1231,13 @@ class _RecoverableSession(_WrappedSession):
     _WrappedSession.__init__(self, self._create_session())
 
   def _create_session(self):
+    retry_time = 0
     while True:
       try:
         return self._sess_creator.create_session()
       except _PREEMPTION_ERRORS as e:
-        logging.info(
+        retry_time = retry_time + 1
+        logging.warning(
             'An error was raised while a session was being created. '
             'This may be due to a preemption of a connected worker '
             'or parameter server. A new session will be created. '
@@ -1244,6 +1246,10 @@ class _RecoverableSession(_WrappedSession):
             'parameter servers. If this error occurs repeatedly, try '
             'increasing the number of parameter servers assigned to '
             'the job. Error: %s', e)
+        # TODO retry_time will be add in config.
+        if retry_time > 10:
+          logging.error("worker is refused by preemption too frequently.")
+          raise
 
   def _check_stop(self):
     try:
