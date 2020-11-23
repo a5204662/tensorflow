@@ -51,6 +51,15 @@ void Worker::GetStatusAsync(const GetStatusRequest* request,
 void Worker::CreateWorkerSessionAsync(const CreateWorkerSessionRequest* request,
                                       CreateWorkerSessionResponse* response,
                                       StatusCallback done) {
+  // my blacklist maybe update delay so return a UnavailableError.
+  auto& return_times = worker_blacklist.find(request.role_name, request.taskid, request.host);
+  if (return_times < 10) {
+    return_times++;
+    return errors::UnavailableError("this worker is unexpected in cluster, please retry .");
+  }
+  else {
+    return errors::PERMISSION_DENIED("this worker is forbad by ps, because of worker in blacklist");
+  }
   Status s = env_->session_mgr->CreateSession(
       request->session_handle(), request->server_def(),
       request->cluster_device_attributes(), request->isolate_session_state());

@@ -1246,6 +1246,7 @@ class _RecoverableSession(_WrappedSession):
             'parameter servers. If this error occurs repeatedly, try '
             'increasing the number of parameter servers assigned to '
             'the job. Error: %s', e)
+        sleep(10)
         # TODO retry_time will be add in config.
         if retry_time > 10:
           logging.error("worker is refused by preemption too frequently.")
