@@ -51,6 +51,7 @@ void Worker::GetStatusAsync(const GetStatusRequest* request,
 void Worker::CreateWorkerSessionAsync(const CreateWorkerSessionRequest* request,
                                       CreateWorkerSessionResponse* response,
                                       StatusCallback done) {
+  // ============== my code(pseudo code) ================
   // my blacklist maybe update delay so return a UnavailableError.
   auto& return_times = worker_blacklist.find(request.role_name, request.taskid, request.host);
   if (return_times < 10) {
