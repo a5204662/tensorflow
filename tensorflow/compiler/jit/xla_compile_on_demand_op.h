@@ -47,12 +47,13 @@ class XlaCompileOnDemandOp : public OpKernel {
                  const XlaCompiler::CompilationResult** result,
                  XlaCompilationCache** cache,
                  ResourceVarsSnapshot* variable_args,
-                 xla::LocalExecutable** executable);
+                 xla::LocalExecutable** executable, bool** executable_busy);
 
   Status Run(OpKernelContext* ctx, XlaCompilationCache* cache,
              const XlaCompiler::CompilationResult* result,
              xla::LocalExecutable* executable,
-             const ResourceVarsSnapshot& variable_args);
+             const ResourceVarsSnapshot& variable_args,
+             bool* executable_busy);
 
   const XlaPlatformInfo platform_info_;
 };

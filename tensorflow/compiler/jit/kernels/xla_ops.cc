@@ -79,12 +79,13 @@ class XlaExecutableClosure {
   explicit XlaExecutableClosure(
       xla::LocalClient* client, xla::LocalExecutable* executable,
       const XlaCompiler::CompilationResult* compilation_result,
-      ResourceVarsSnapshot resource_var_snapshots, int num_constant_args)
+      ResourceVarsSnapshot resource_var_snapshots, 
+      int num_constant_args, bool* executable_busy)
       : client_(client),
         executable_(executable),
         compilation_result_(compilation_result),
         resource_var_snapshots_(std::move(resource_var_snapshots)),
-        num_constant_args_(num_constant_args) {}
+        num_constant_args_(num_constant_args),executable_busy_(executable_busy) {}
 
   XlaExecutableClosure(XlaExecutableClosure&&) = default;
   XlaExecutableClosure& operator=(XlaExecutableClosure&&) = default;
@@ -98,6 +99,7 @@ class XlaExecutableClosure {
     return resource_var_snapshots_;
   }
   int num_constant_args() const { return num_constant_args_; }
+  bool* executable_busy() const { return executable_busy_; }
 
  private:
   xla::LocalClient* client_;
@@ -105,6 +107,7 @@ class XlaExecutableClosure {
   const XlaCompiler::CompilationResult* compilation_result_;
   ResourceVarsSnapshot resource_var_snapshots_;
   int num_constant_args_;
+  bool* executable_busy_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(XlaExecutableClosure);
 };
@@ -172,7 +175,7 @@ static Status CompileToLocalExecutable(
     XlaCompilationCache::CompileMode compile_mode,
     bool may_alias_resource_update, xla::LocalClient** client,
     const XlaCompiler::CompilationResult** compilation_result,
-    xla::LocalExecutable** executable) {
+    xla::LocalExecutable** executable, bool** executable_busy) {
   // We store information about the JIT-compiled XLA computation
   // in the ResourceMgr.
   ResourceMgr* rm = ctx->resource_manager();
@@ -212,7 +215,7 @@ static Status CompileToLocalExecutable(
           static_cast<Device*>(ctx->device()));
   TF_RETURN_IF_ERROR(args.status());
   return cache->Compile(options, function, *args, compile_options, compile_mode,
-                        compilation_result, executable);
+                        compilation_result, executable, executable_busy);
 }
 
 // Resolve the device assignment for the TF single-host MirroredStrategy by
@@ -288,6 +291,7 @@ void XlaLocalLaunchBase::Compute(OpKernelContext* ctx) {
   xla::LocalExecutable* executable;
 
   std::vector<VariableInfo> variable_infos;
+  bool* executable_busy = nullptr;
   {
     OP_REQUIRES_OK(
         ctx, GetVariableInfosFromInputs(ctx->resource_manager(), ctx->device(),
@@ -297,7 +301,7 @@ void XlaLocalLaunchBase::Compute(OpKernelContext* ctx) {
         ctx, function_, /*has_ref_vars=*/has_ref_vars_, platform_info_, inputs,
         variable_infos, constants_, XlaCompilationCache::CompileMode::kStrict,
         /*may_alias_resource_update=*/true, &client, &compilation_result,
-        &executable);
+        &executable, &executable_busy);
     OP_REQUIRES_OK(ctx, s);
   }
 
@@ -365,7 +369,8 @@ void XlaLocalLaunchBase::Compute(OpKernelContext* ctx) {
                /*missing_ctx_input_prefix=*/0, absl::MakeSpan(variable_infos),
                input_output_alias, resource_var_ptrs));
 
-  VLOG(1) << "Done";
+  *executable_busy = false;
+  VLOG(1) << "Done," << executable_busy;
 }
 
 namespace {
@@ -461,6 +466,8 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
                : XlaCompilationCache::CompileMode::kLazy;
   }();
 
+  bool* executable_busy = nullptr;
+
   if (GetXlaOpsCommonFlags().tf_xla_always_defer_compilation ||
       cannot_compile_cluster) {
     executable = nullptr;
@@ -476,7 +483,8 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
     Status status = CompileToLocalExecutable(
         ctx, function_, has_ref_vars_, platform_info_, inputs, variable_infos,
         constants_, compile_mode, /*may_alias_resource_update=*/false, &client,
-        &kernel, &executable);
+        &kernel, &executable, &executable_busy);
+    VLOG(1) << "CompileToLocalExecutable done status:" << *executable_busy;
     OP_REQUIRES_OK(ctx, SnapshotResourceVariables(ctx, resources_,
                                                   variable_infos, &variables));
     if (compile_mode != XlaCompilationCache::CompileMode::kLazy ||
@@ -511,6 +519,7 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
     compilation_successful.scalar<bool>()() = false;
     ctx->set_output(0, Tensor(cpu_allocator, DT_STRING, TensorShape({})));
     ctx->set_output(1, compilation_successful);
+    *executable_busy = false;
     return;
   }
 
@@ -520,7 +529,7 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
   // variables.
   XlaExecutableClosureStore::KeyT key =
       XlaExecutableClosureStore::Global()->Produce(XlaExecutableClosure(
-          client, executable, kernel, std::move(variables), constants_.size()));
+          client, executable, kernel, std::move(variables), constants_.size(), executable_busy));
 
   Tensor compilation_key(cpu_allocator, DT_STRING, TensorShape({}));
   compilation_key.flat<tstring>()(0) = key;
@@ -620,6 +629,7 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
           ctx, closure.compilation_result(), execution_output->ConsumeResult(),
           /*missing_ctx_input_prefix=*/closure.num_constant_args(),
           absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs));
+  *(closure.executable_busy()) = false;
 }
 
 XlaMergeOp::XlaMergeOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}

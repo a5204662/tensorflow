@@ -16,6 +16,10 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_JIT_XLA_COMPILATION_CACHE_H_
 #define TENSORFLOW_COMPILER_JIT_XLA_COMPILATION_CACHE_H_
 
+#include <list>
+#include <queue>
+#include <memory>
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/types/optional.h"
@@ -31,8 +35,22 @@ limitations under the License.
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/thread_annotations.h"
+#include "tensorflow/core/util/env_var.h"
+#include "tensorflow/core/util/lru_cache.h"
 
 namespace tensorflow {
+
+template <class Key, class Value, class MapFunc,
+          class MapType =
+              absl::flat_hash_map<Key, lru::Node<Key, Value>*, MapFunc>,
+          class LockType = lru::NullLock>
+class XLACache
+    : public lru::Cache<Key, Value, MapFunc, MapType, lru::NullLock> {
+ public:
+  typedef lru::Cache<Key, Value, MapFunc, MapType, lru::NullLock> base;
+  XLACache(const std::string& name = "", size_t maxSize = 64)
+      : base(name, maxSize) {}
+};
 
 // The XlaCompilationCache class caches the results of the XlaCompiler class,
 // which converts a Tensorflow graph into a compiled XLA compilation.
@@ -84,7 +102,7 @@ class XlaCompilationCache : public ResourceBase {
                  const XlaCompiler::CompileOptions& compile_options,
                  CompileMode compile_mode,
                  const XlaCompiler::CompilationResult** out_compilation_result,
-                 xla::LocalExecutable** out_executable);
+                 xla::LocalExecutable** out_executable, bool** executable_busy);
 
   // As above, but calls XlaCompiler::CompileSingleOp instead of
   // XlaCompiler::CompileFunction. If MLIR bridge is enabled through ConfigProto
@@ -95,7 +113,7 @@ class XlaCompilationCache : public ResourceBase {
       const std::vector<XlaCompiler::Argument>& args, OpKernelContext* ctx,
       const XlaCompiler::CompileOptions& compile_options,
       const XlaCompiler::CompilationResult** out_compilation_result,
-      xla::LocalExecutable** out_executable);
+      xla::LocalExecutable** out_executable, bool** executable_busy);
 
   xla::LocalClient* client() const { return client_; }
   const DeviceType& device_type() const { return device_type_; }
@@ -141,7 +159,7 @@ class XlaCompilationCache : public ResourceBase {
                                  XlaCompiler::CompilationResult*)>& compile_fn,
       CompileMode compile_mode,
       const XlaCompiler::CompilationResult** out_compilation_result,
-      xla::LocalExecutable** out_executable);
+      xla::LocalExecutable** out_executable,bool** executable_busy);
 
   // Takes `result` which has been compiled from a Tensorflow subgraph to a
   // XLA computation already, and generates an XLA LocalExecutable `executable`.
@@ -171,6 +189,9 @@ class XlaCompilationCache : public ResourceBase {
     // The XLA executable compiled from <computation>. May be null if no
     // executable has been built.
     std::unique_ptr<xla::LocalExecutable> executable TF_GUARDED_BY(mu);
+
+    // true: executable is using; false: executable is empty .
+    bool executable_busy_;
   };
 
   Status CompileStrict(
@@ -189,9 +210,33 @@ class XlaCompilationCache : public ResourceBase {
                                  const std::vector<XlaCompiler::Argument>& args,
                                  XlaCompiler::CompilationResult*)>& compile_fn);
 
-  mutex compile_cache_mu_;
-  absl::flat_hash_map<Signature, std::unique_ptr<Entry>, Signature::Hash> cache_
-      TF_GUARDED_BY(compile_cache_mu_);
+  class InternalCache {
+   public:
+     typedef XLACache<Signature, Entry*, Signature::Hash> ClusterLRUCache;
+     typedef absl::flat_hash_map<std::string, std::unique_ptr<ClusterLRUCache>>  XlaInternalCache;
+   public:
+    InternalCache():executable_busy_queue_() {
+      constexpr static char const* pXlaCacheMaxSize = "TF_XLA_CACHE_MAX_SIZE";
+      int64 tmpMaxSize = 8192;
+      auto ret = ReadInt64FromEnvVar(pXlaCacheMaxSize, 8192, &tmpMaxSize);
+      if (ret.ok()) {
+        max_size_ = tmpMaxSize;
+        executable_busy_warn_= false;
+        LOG(INFO) << "Init XLA Cache max size:" << max_size_ << " from "
+                  << pXlaCacheMaxSize;
+      }
+    }
+    Entry* GetEntry(const Signature* signature,
+                    const std::string* function_name);
+   private:
+    mutex compile_cache_mu_;
+    XlaInternalCache cache_ GUARDED_BY(compile_cache_mu_);
+    // Template store using entry .
+    std::queue<Entry*> executable_busy_queue_;
+    bool executable_busy_warn_;
+    int64 max_size_;
+  };
+  InternalCache cache_;
 
   struct ClusterCompileStats {
     // Number of times the cluster has been (re-)compiled.

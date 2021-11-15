@@ -38,12 +38,12 @@ static xla::StatusOr<xla::LocalExecutable*> GetLocalExecutable(
     const XlaCompiler::CompileOptions& compile_options,
     const NameAttrList& function, XlaCompilationCache* cache,
     const std::vector<XlaCompiler::Argument>& args,
-    const XlaCompiler& compiler) {
+    const XlaCompiler& compiler, bool **executable_busy) {
   const XlaCompiler::CompilationResult* compilation_result = nullptr;
   xla::LocalExecutable* executable = nullptr;
   TF_RETURN_IF_ERROR(cache->Compile(options, function, args, compile_options,
                                     XlaCompilationCache::CompileMode::kStrict,
-                                    &compilation_result, &executable));
+                                    &compilation_result, &executable, executable_busy));
   return executable;
 }
 
@@ -116,7 +116,7 @@ xla::StatusOr<std::string> GetCompilerIr(
       XlaComputationLaunchContext::BuildXlaCompilerArguments(
           constant_arg_indices, inputs, variable_infos, dev);
   TF_RETURN_IF_ERROR(args.status());
-
+  bool *executable_busy = nullptr;
   switch (stage) {
     case IrExportStage::HLO:
     case IrExportStage::HLO_SERIALIZED: {
@@ -140,18 +140,22 @@ xla::StatusOr<std::string> GetCompilerIr(
     case IrExportStage::OPTIMIZED_HLO:
     case IrExportStage::OPTIMIZED_HLO_SERIALIZED: {
       xla::StatusOr<xla::LocalExecutable*> executable = GetLocalExecutable(
-          options, compile_options, function, cache, *args, compiler);
+          options, compile_options, function, cache, *args, compiler, &executable_busy);
       TF_RETURN_IF_ERROR(executable.status());
       xla::Executable* new_executable = (*executable)->executable();
       if (stage == IrExportStage::OPTIMIZED_HLO_SERIALIZED) {
-        return new_executable->module().ToProto().SerializeAsString();
+        auto ret = new_executable->module().ToProto().SerializeAsString();
+        *executable_busy = false;
+        return ret; 
       } else {
-        return new_executable->module().ToString();
+        auto ret = new_executable->module().ToString();
+        *executable_busy = false;
+        return ret;
       }
     }
     case IrExportStage::OPTIMIZED_HLO_DOT: {
       xla::StatusOr<xla::LocalExecutable*> executable = GetLocalExecutable(
-          options, compile_options, function, cache, *args, compiler);
+          options, compile_options, function, cache, *args, compiler, &executable_busy);
       TF_RETURN_IF_ERROR(executable.status());
       xla::StatusOr<std::string> graph = xla::RenderGraph(
           *(*executable)->executable()->module().entry_computation(),
@@ -160,6 +164,7 @@ xla::StatusOr<std::string> GetCompilerIr(
           /*hlo_execution_profile=*/nullptr,
           /*hlo_render_options=*/{});
       TF_RETURN_IF_ERROR(graph.status());
+      *executable_busy = false;
       return *graph;
     }
   }

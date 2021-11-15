@@ -45,7 +45,8 @@ Status XlaCompileOnDemandOp::Run(OpKernelContext* ctx,
                                  XlaCompilationCache* cache,
                                  const XlaCompiler::CompilationResult* result,
                                  xla::LocalExecutable* executable,
-                                 const ResourceVarsSnapshot& variable_args) {
+                                 const ResourceVarsSnapshot& variable_args,
+                                 bool* executable_busy) {
   xla::LocalClient* client = static_cast<xla::LocalClient*>(cache->client());
 
   se::Stream* stream =
@@ -93,13 +94,14 @@ Status XlaCompileOnDemandOp::Run(OpKernelContext* ctx,
       ctx, result, execution_output.ConsumeResult(),
       /*missing_ctx_input_prefix=*/0, absl::MakeSpan(*variable_infos),
       input_output_alias, snapshot_ptrs));
+  *executable_busy = false;
   return Status::OK();
 }
 
 Status XlaCompileOnDemandOp::Compile(
     OpKernelContext* ctx, const XlaCompiler::CompilationResult** result,
     XlaCompilationCache** cache, ResourceVarsSnapshot* variable_args,
-    xla::LocalExecutable** executable) {
+    xla::LocalExecutable** executable, bool** executable_busy) {
 
   std::vector<int> constant_input_indices;
   TF_RETURN_IF_ERROR(GetCompileTimeConstInputs(
@@ -154,7 +156,7 @@ Status XlaCompileOnDemandOp::Compile(
   }
 
   return (*cache)->CompileSingleOp(options, *args, ctx, compile_options, result,
-                                   executable);
+                                   executable, executable_busy);
 }
 
 void XlaCompileOnDemandOp::Compute(OpKernelContext* ctx) {
@@ -164,14 +166,15 @@ void XlaCompileOnDemandOp::Compute(OpKernelContext* ctx) {
   XlaCompilationCache* cache;
   OP_REQUIRES(ctx, ctx->function_library(),
               errors::Internal("Function library missing"));
+  bool *executable_busy = nullptr;
   OP_REQUIRES_OK(ctx,
-                 Compile(ctx, &result, &cache, &variable_args, &executable));
+                 Compile(ctx, &result, &cache, &variable_args, &executable, &executable_busy));
 
   // Hold the reference to the JIT during evaluation. (We could probably
   // free it sooner because the ResourceMgr will retain a reference, but
   // this is more obviously correct.)
   core::ScopedUnref cache_ref(cache);
-  OP_REQUIRES_OK(ctx, Run(ctx, cache, result, executable, variable_args));
+  OP_REQUIRES_OK(ctx, Run(ctx, cache, result, executable, variable_args, executable_busy));
 }
 
 }  // namespace tensorflow

@@ -200,7 +200,7 @@ Status XlaCompilationCache::Compile(
     const XlaCompiler::CompileOptions& compile_options,
     CompileMode compile_mode,
     const XlaCompiler::CompilationResult** out_compilation_result,
-    xla::LocalExecutable** out_executable) {
+    xla::LocalExecutable** out_executable, bool **executable_busy) {
   // !!Pay attention when additional variables must be captured by this
   // lambda!! compile_fn can run asynchronously after this funcion has
   // exited. Make sure that any variable needed inside compile_fn is
@@ -212,7 +212,7 @@ Status XlaCompilationCache::Compile(
     return compiler->CompileFunction(compile_options, function, args, result);
   };
   return CompileImpl(options, function, args, compile_fn, compile_mode,
-                     out_compilation_result, out_executable);
+                     out_compilation_result, out_executable, executable_busy);
 }
 
 static bool ShouldBeMegamorphic(int64 compile_count, int64 execution_count) {
@@ -275,7 +275,7 @@ Status XlaCompilationCache::CompileSingleOp(
     const std::vector<XlaCompiler::Argument>& args, OpKernelContext* ctx,
     const XlaCompiler::CompileOptions& compile_options,
     const XlaCompiler::CompilationResult** out_compilation_result,
-    xla::LocalExecutable** out_executable) {
+    xla::LocalExecutable** out_executable, bool **executable_busy) {
   const NodeDef& def = ctx->op_kernel().def();
   NameAttrList name;
   name.set_name(def.op());
@@ -321,7 +321,7 @@ Status XlaCompilationCache::CompileSingleOp(
         *options.flib_def, debug_info, options.shape_representation_fn, result);
   };
   return CompileImpl(options, name, args, compile_op, CompileMode::kStrict,
-                     out_compilation_result, out_executable);
+                     out_compilation_result, out_executable, executable_busy);
 }
 
 namespace {
@@ -446,7 +446,7 @@ Status XlaCompilationCache::CompileImpl(
                                XlaCompiler::CompilationResult*)>& compile_fn,
     CompileMode compile_mode,
     const XlaCompiler::CompilationResult** out_compilation_result,
-    xla::LocalExecutable** out_executable) {
+    xla::LocalExecutable** out_executable, bool** executable_busy) {
   if (FailOnXlaCompilation()) {
     return errors::Internal("XLA compilation disabled");
   }
@@ -477,16 +477,8 @@ Status XlaCompilationCache::CompileImpl(
 
   // The outer lock protects the existence of the cache entry. It does not
   // protect the contents of the cache entry.
-  Entry* entry;
-  {
-    mutex_lock lock(compile_cache_mu_);
-    // Find or create a cache entry.
-    std::unique_ptr<Entry>& e = cache_[signature];
-    if (!e) {
-      e.reset(new Entry);
-    }
-    entry = e.get();
-  }
+  Entry* entry = cache_.GetEntry(&signature, &function.name());
+  *executable_busy = &(entry->executable_busy_);
 
   // We always compile a cluster the very first time it is executed.  This is an
   // optimistic guess that pays off for statically shaped TensorFlow graphs
@@ -607,6 +599,65 @@ Status XlaCompilationCache::CompileImpl(
     *out_executable = entry->executable.get();
   }
   return Status::OK();
+}
+
+XlaCompilationCache::Entry* XlaCompilationCache::InternalCache::GetEntry(
+    const Signature* signature, const std::string* function_name) {
+  Entry* entry = nullptr;
+  mutex_lock lock(compile_cache_mu_);
+
+  // Find LRUCache by function_name, like cluster_2.
+  std::unique_ptr<ClusterLRUCache>& cache = cache_[*function_name];
+  if (!cache) {
+    cache.reset(new ClusterLRUCache(*function_name, max_size_));
+  }
+  // Find or create a cache entry.
+  bool find = cache->tryGet(*signature, entry);
+  if (!find) {
+    entry = new Entry;
+
+    // LRUCache will write eliminated entry address to `del`.
+    Entry* del = nullptr;
+    bool no_lru_disuse = cache->insert(*signature, entry, del);
+
+    // Find eliminated entry .
+    if (!no_lru_disuse) {
+
+      // Try to clear up the previously remaining entrys.
+      while (executable_busy_queue_.size()) {
+        auto tmp_del = executable_busy_queue_.front();
+        executable_busy_queue_.pop();
+        if (!tmp_del->executable_busy_ && entry->compile_state == CompileState::kCompiled) {
+          delete tmp_del;
+        }
+        else {
+          // Adjust the first busy entry in the queue to the end of the queue.
+          executable_busy_queue_.push(tmp_del);
+          break;
+        }
+      }
+
+      if (del && del->executable_busy_ == true) {
+        // If eliminated entry is busy .
+        executable_busy_queue_.push(del);
+        if (executable_busy_warn_ && executable_busy_queue_.size() > max_size_) {
+          executable_busy_warn_ = false;
+          LOG(WARNING) << "executable_busy_queue store too many entrys .";
+        }
+      }
+      else {
+        // If eliminated entry is unused .
+        delete del;
+      }
+    }
+    VLOG(1) << "Insert an item in " << function_name->c_str()
+            << "'s xla cache .";
+  }
+
+  // Mark the entry for use .
+  entry->executable_busy_ = true;
+  VLOG(1) << "Cache try get done" << find << ",using true : " << &(entry->executable_busy_);
+  return entry;
 }
 
 }  // namespace tensorflow

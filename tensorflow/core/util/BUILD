@@ -237,6 +237,7 @@ filegroup(
     name = "lib_internal_public_hdrs",
     srcs = [
         "env_var.h",
+        "lru_cache.h",
     ],
     visibility = ["//tensorflow/core:__pkg__"],
 )
